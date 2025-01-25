@@ -1,8 +1,11 @@
+// Chamadas de bibliotecas externas
+
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include "esp_system.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -20,10 +23,11 @@
 #include <stdlib.h>
 #include "driver/gpio.h"
 
+// Coisas do bluetooth
+
 #define SPP_TAG "LOGS"            // Tag para logs
 #define SPP_SERVER_NAME "YURIESP" // Nome do servidor bluetooth
 #define SPP_SHOW_DATA 0
-// #define SPP_SHOW_SPEED 1
 #define SPP_SHOW_MODE SPP_SHOW_DATA // Config do modo de exibição
 
 // static const char local_device_name[] = SPP_SERVER_NAME;
@@ -44,6 +48,27 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param);
 uint32_t bt_handle;
 uint8_t bt_buffer[16];
 bool bt_data_flag = 0;
+
+// Função para obter dados do Bluetooth
+int get_string_bt(char *msg)
+{
+    if (bt_data_flag)
+    {
+        strcpy(msg, (char *)bt_buffer);
+        bt_data_flag = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// Função para enviar dados pelo Bluetooth
+void send_string_bt(char *msg)
+{
+    int len = strlen(msg);
+    esp_spp_write(bt_handle, len, (uint8_t *)msg);
+}
+
+// Coisas do GPIO
 
 // Definição de pinos GPIO para botões
 #define BUTTON_ONE GPIO_NUM_4    // Botão 1 entrada 4
@@ -72,29 +97,347 @@ int input_senha[TAMANHO_SENHA] = {0};
 // Variável para dizer em qual lugar do vetor senha estamos
 int input_index = 0;
 
-// Variavel para mudar a senha
-bool aguardando = false;
+// Coisas RTC e VNS
+#define STORAGE_NAMESPACE "storage"
+#define LOG_CAPACITY 10
 
-// Função para obter dados do Bluetooth
-int get_string_bt(char *msg)
+static uint8_t current_marker = 0x55;
+static uint32_t current_log_index = 0;
+
+// Função para salvar um valor na NVS
+void save_to_nvs(const char *key, const char *value)
 {
-    if (bt_data_flag)
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
     {
-        strcpy(msg, (char *)bt_buffer);
-        bt_data_flag = 0;
-        return 1;
+        ESP_LOGE(SPP_TAG, "Erro ao abrir NVS (%s)!", esp_err_to_name(err));
+        return;
     }
-    return 0;
+
+    err = nvs_set_str(nvs_handle, key, value);
+    if (err == ESP_OK)
+    {
+        nvs_commit(nvs_handle);
+        ESP_LOGI(SPP_TAG, "Salvo com sucesso: %s = %s", key, value);
+    }
+    else
+    {
+        ESP_LOGE(SPP_TAG, "Erro ao salvar (%s)!", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
 }
 
-// Função para enviar dados pelo Bluetooth
-void send_string_bt(char *msg)
+// Função para salvar um log na NVS
+void save_log_to_nvs(const char *log_key, const char *log_entry)
 {
-    int len = strlen(msg);
-    esp_spp_write(bt_handle, len, (uint8_t *)msg);
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(SPP_TAG, "Erro ao abrir NVS para logs (%s)!", esp_err_to_name(err));
+        return;
+    }
+
+    char key[16];
+    snprintf(key, sizeof(key), "%s_%lu", log_key, current_log_index);
+
+    err = nvs_set_str(nvs_handle, key, log_entry);
+    if (err == ESP_OK)
+    {
+        nvs_commit(nvs_handle);
+        ESP_LOGI(SPP_TAG, "Log salvo: %s = %s", key, log_entry);
+
+        current_log_index = (current_log_index + 1) % LOG_CAPACITY;
+        current_marker = (current_marker == 0x55) ? 0xAA : 0x55;
+    }
+    else
+    {
+        ESP_LOGE(SPP_TAG, "Erro ao salvar log (%s)!", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
 }
 
-// Callback principal do SPP
+// Função para ler logs da NVS
+void read_logs_from_nvs(const char *log_key)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(STORAGE_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(SPP_TAG, "Erro ao abrir NVS para leitura de logs (%s)!", esp_err_to_name(err));
+        return;
+    }
+
+    char key[16];
+    char log_entry[128];
+    size_t required_size;
+
+    ESP_LOGI(SPP_TAG, "Últimos %d logs:", LOG_CAPACITY);
+    for (uint32_t i = 0; i < LOG_CAPACITY; i++)
+    {
+        snprintf(key, sizeof(key), "%s_%lu", log_key, i);
+
+        required_size = sizeof(log_entry);
+        err = nvs_get_str(nvs_handle, key, log_entry, &required_size);
+        if (err == ESP_OK)
+        {
+            ESP_LOGI(SPP_TAG, "Log %lu: %s", i, log_entry);
+        }
+        else
+        {
+            ESP_LOGW(SPP_TAG, "Log %lu não encontrado.", i);
+        }
+    }
+
+    nvs_close(nvs_handle);
+}
+
+// Comando para atualizar a data
+void cmd_data(char *nova_data)
+{
+    struct tm tm;
+    if (strptime(nova_data, "%d-%m-%Y", &tm) == NULL)
+    {
+        ESP_LOGE(SPP_TAG, "Formato de data inválido. Use DD-MM-YY.");
+        return;
+    }
+
+    time_t t = time(NULL);
+    struct tm *current_time = localtime(&t);
+
+    current_time->tm_year = tm.tm_year;
+    current_time->tm_mon = tm.tm_mon;
+    current_time->tm_mday = tm.tm_mday;
+
+    const struct timeval tv = {.tv_sec = mktime(current_time), .tv_usec = 0};
+    settimeofday(&tv, NULL);
+    ESP_LOGI(SPP_TAG, "Data atualizada para: %s", nova_data);
+
+    save_to_nvs("data", nova_data);
+}
+
+// Comando para atualizar a hora
+void cmd_hora(char *nova_hora)
+{
+    struct tm tm;
+    if (strptime(nova_hora, "%H:%M:%S", &tm) == NULL)
+    {
+        ESP_LOGE(SPP_TAG, "Formato de hora inválido. Use HH:MM:SS.");
+        return;
+    }
+
+    time_t t = time(NULL);
+    struct tm *current_time = localtime(&t);
+
+    current_time->tm_hour = tm.tm_hour;
+    current_time->tm_min = tm.tm_min;
+    current_time->tm_sec = tm.tm_sec;
+
+    const struct timeval tv = {.tv_sec = mktime(current_time), .tv_usec = 0};
+    settimeofday(&tv, NULL);
+    ESP_LOGI(SPP_TAG, "Hora atualizada para: %s", nova_hora);
+
+    save_to_nvs("hora", nova_hora);
+}
+
+// Comando para mostrar a data e a hora
+void cmd_relogio()
+{
+    time_t now;
+    time(&now);
+    struct tm *timeinfo = localtime(&now);
+
+    char buffer[64];
+    strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", timeinfo);
+    ESP_LOGI(SPP_TAG, "Data e Hora atuais: %s\n", buffer);
+}
+
+// Comando para registrar um log
+void cmd_log()
+{
+    time_t now;
+    time(&now);
+    struct tm *timeinfo = localtime(&now);
+
+    uint8_t dia = timeinfo->tm_mday;
+    uint8_t mes = timeinfo->tm_mon + 1;
+    uint8_t ano = timeinfo->tm_year - 100;
+    uint8_t hora = timeinfo->tm_hour;
+    uint8_t minuto = timeinfo->tm_min;
+    uint8_t segundo = timeinfo->tm_sec;
+
+    char log_entry[64];
+    snprintf(log_entry, sizeof(log_entry), "%02X %02u %02u %02u %02u %02u %02u 00", current_marker, dia, mes, ano, hora, minuto, segundo);
+
+    save_log_to_nvs("log", log_entry);
+}
+
+// Coisas da state machine
+
+typedef enum
+{
+    STATE_RUNNING,
+    STATE_CHANGE_PASSWORD,
+    STATE_CHANGE_HORA,
+    STATE_CHANGE_DATA
+} state_t;
+
+state_t current_state = STATE_RUNNING;
+
+void state_running(char received_msg[128])
+{
+    if (strcmp(received_msg, "senha") == 0)
+    {
+        ESP_LOGI(SPP_TAG, "Digite os 6 dígitos da nova senha:\n");
+        send_string_bt("Digite os 6 dígitos da nova senha:\n");
+        current_state = STATE_CHANGE_PASSWORD;
+    }
+    else if (strcmp(received_msg, "abre") == 0)
+    {
+        gpio_set_level(SUCCESS_BUTTON, 1); // Aciona o GPIO de sucesso
+        vTaskDelay(pdMS_TO_TICKS(2000));   // Aguarda 2 segundo
+        gpio_set_level(SUCCESS_BUTTON, 0); // Desliga o GPIO
+        int dentro = 1;
+        while (dentro)
+        {
+            // Testando todos os botões
+            for (int i = 0; i < NUM_BUTTONS; i++)
+            {
+
+                // Variável que ativa quando qualquer botão é pressionado
+                int button_gpio = (i == 0) ? BUTTON_ONE : (i == 1) ? BUTTON_TWO
+                                                      : (i == 2)   ? BUTTON_THREE
+                                                                   : BUTTON_FOUR;
+
+                // Se um botão é pressionado
+                if (gpio_get_level(button_gpio) == 1)
+                {
+
+                    // Exibo o botão pressionado
+                    // printf("%d\n", valores_botoes[i]);
+                    // Se o index é menor que o tamanho da senha
+                    if (input_index < TAMANHO_SENHA)
+                    {
+                        // Atribuo o valor i ao próximo index
+                        input_senha[input_index++] = valores_botoes[i];
+                    }
+                    // Se o botão ainda está pressionado
+                    while (gpio_get_level(button_gpio) == 1)
+                    {
+                        // Espero um pouco
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                }
+            }
+            // Se preenchemos todo o vetor senha do usuário
+            if (input_index == TAMANHO_SENHA)
+            {
+
+                // Assumimos que ele acertou
+                int sucesso = 1;
+                // Vamos verificar se ele acertou comparado cada item do vetor com a senha
+                for (int i = 0; i < TAMANHO_SENHA; i++)
+                {
+                    // Se algum desses itens não forem iguais ao da senha
+                    if (input_senha[i] != senha[i])
+                    {
+                        // Ele falhou
+                        sucesso = 0;
+                        break;
+                    }
+                }
+                if (sucesso)
+                {
+                    // Se ele acertou
+                    send_string_bt("Senha correta!\n");
+                    ESP_LOGI(SPP_TAG, "Senha correta! \n");
+                    cmd_log();
+                    gpio_set_level(SUCCESS_BUTTON, 1); // Aciona o GPIO de sucesso
+                    vTaskDelay(pdMS_TO_TICKS(1000));   // Aguarda 1 segundo
+                    gpio_set_level(SUCCESS_BUTTON, 0); // Desliga o GPIO
+                    dentro = 0;
+                }
+                else
+                {
+                    // Se ele errou
+                    send_string_bt("Senha incorreta. \n");
+                    ESP_LOGI(SPP_TAG, "Senha incorreta! \n");
+                    gpio_set_level(FAILURE_BUTTON, 1); // Aciona o GPIO de falha
+                    vTaskDelay(pdMS_TO_TICKS(1000));   // Aguarda 1 segundo
+                    gpio_set_level(FAILURE_BUTTON, 0); // Desliga o GPIO
+                    dentro = 0;
+                }
+
+                // Resetamos o vetor senha para tentar de novo
+                for (int i = 0; i < TAMANHO_SENHA; i++)
+                {
+                    input_senha[i] = 0;
+                }
+                input_index = 0;
+            }
+
+            // Esperamos um pouquinho
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    else if (strcmp(received_msg, "data") == 0)
+    {
+        ESP_LOGI(SPP_TAG, "Digite DDMMAA:\n");
+        send_string_bt("Digite DDMMAA:\n");
+        current_state = STATE_CHANGE_DATA;
+    }
+    else if (strcmp(received_msg, "hora") == 0)
+    {
+        ESP_LOGI(SPP_TAG, "Digite hhmmss:\n");
+        send_string_bt("Digite hhmmss:\n");
+        current_state = STATE_CHANGE_HORA;
+    }
+    else if (strcmp(received_msg, "relogio") == 0)
+    {
+        cmd_relogio();
+    }
+    else if (strcmp(received_msg, "log") == 0)
+    {
+        read_logs_from_nvs("log");
+    }
+    else
+    {
+        ESP_LOGW(SPP_TAG, "Unknown command: %s\n", received_msg);
+        send_string_bt("Unknown command.\n");
+    }
+}
+
+void state_change_password(char received_msg[128])
+{
+    received_msg[strcspn(received_msg, "\r\n")] = '\0';
+    if (strlen(received_msg) == TAMANHO_SENHA && strspn(received_msg, "0123456789") == TAMANHO_SENHA)
+    {
+        for (int i = 0; i < TAMANHO_SENHA; i++)
+        {
+            senha[i] = received_msg[i] - '0'; // Converte char para inteiro
+        }
+        ESP_LOGI(SPP_TAG, "Senha alterada com sucesso: %s\n", received_msg);
+        send_string_bt("Senha atualizada com sucesso!\n");
+    }
+    else
+    {
+        ESP_LOGI(SPP_TAG, "Senha inválida! Apenas dígitos são permitidos.\n");
+        send_string_bt("Senha inválida! Certifique-se de usar apenas números.\n");
+    }
+}
+
+void state_change_hora(char received_msg[128])
+{
+}
+
+void state_change_data(char received_msg[128])
+{
+}
+
+// Callback principal do SPP Bluetooth, aqui as coisas acontecem
 static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 {
     switch (event)
@@ -159,130 +502,31 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         {
             // maldito!
             received_msg[strcspn(received_msg, "\r\n")] = '\0';
-            if (aguardando)
+
+            switch (current_state)
             {
-                printf("teste %s\n", received_msg);
-                received_msg[strcspn(received_msg, "\r\n")] = '\0';
-                printf("teste %s\n", received_msg);
-                if (strlen(received_msg) == TAMANHO_SENHA && strspn(received_msg, "0123456789") == TAMANHO_SENHA)
-                {
-                    for (int i = 0; i < TAMANHO_SENHA; i++)
-                    {
-                        senha[i] = received_msg[i] - '0'; // Converte char para inteiro
-                    }
-                    ESP_LOGI(SPP_TAG, "Senha alterada com sucesso: %s\n", received_msg);
-                    send_string_bt("Senha atualizada com sucesso!\n");
-                    aguardando = false;
-                }
-                else
-                {
-                    ESP_LOGI(SPP_TAG, "Senha inválida! Apenas dígitos são permitidos.\n");
-                    send_string_bt("Senha inválida! Certifique-se de usar apenas números.\n");
-                    aguardando = false;
-                }
-            }
-            else if (strcmp(received_msg, "senha") == 0)
-            {
-                ESP_LOGI(SPP_TAG, "Digite os 6 dígitos da nova senha:\n");
-                send_string_bt("Digite os 6 dígitos da nova senha:\n");
-                aguardando = true;
-            }
-            else if (strcmp(received_msg, "abre") == 0)
-            {
-                gpio_set_level(SUCCESS_BUTTON, 1); // Aciona o GPIO de sucesso
-                vTaskDelay(pdMS_TO_TICKS(2000));   // Aguarda 2 segundo
-                gpio_set_level(SUCCESS_BUTTON, 0); // Desliga o GPIO
-                int dentro = 1;
-                while (dentro)
-                {
-                    // Testando todos os botões
-                    for (int i = 0; i < NUM_BUTTONS; i++)
-                    {
+            case STATE_RUNNING:
+                state_running(received_msg);
+                break;
 
-                        // Variável que ativa quando qualquer botão é pressionado
-                        int button_gpio = (i == 0) ? BUTTON_ONE : (i == 1) ? BUTTON_TWO
-                                                              : (i == 2)   ? BUTTON_THREE
-                                                                           : BUTTON_FOUR;
+            case STATE_CHANGE_DATA:
+                state_change_data(received_msg);
 
-                        // Se um botão é pressionado
-                        if (gpio_get_level(button_gpio) == 1)
-                        {
+                current_state = STATE_RUNNING;
+                break;
+            case STATE_CHANGE_PASSWORD:
+                state_change_password(received_msg);
+                current_state = STATE_RUNNING;
+                break;
+            case STATE_CHANGE_HORA:
+                state_change_hora(received_msg);
+                current_state = STATE_RUNNING;
+                break;
 
-                            // Exibo o botão pressionado
-                            // printf("%d\n", valores_botoes[i]);
-                            // Se o index é menor que o tamanho da senha
-                            if (input_index < TAMANHO_SENHA)
-                            {
-                                // Atribuo o valor i ao próximo index
-                                input_senha[input_index++] = valores_botoes[i];
-                            }
-                            // Se o botão ainda está pressionado
-                            while (gpio_get_level(button_gpio) == 1)
-                            {
-                                // Espero um pouco
-                                vTaskDelay(pdMS_TO_TICKS(50));
-                            }
-                        }
-                    }
-                    // Se preenchemos todo o vetor senha do usuário
-                    if (input_index == TAMANHO_SENHA)
-                    {
-
-                        // Assumimos que ele acertou
-                        int sucesso = 1;
-                        // Vamos verificar se ele acertou comparado cada item do vetor com a senha
-                        for (int i = 0; i < TAMANHO_SENHA; i++)
-                        {
-                            // Se algum desses itens não forem iguais ao da senha
-                            if (input_senha[i] != senha[i])
-                            {
-                                // Ele falhou
-                                sucesso = 0;
-                                break;
-                            }
-                        }
-                        if (sucesso)
-                        {
-                            // Se ele acertou
-                            send_string_bt("Senha correta!\n");
-                            ESP_LOGI(SPP_TAG, "Senha correta! \n");
-                            printf("BUFFER PARA DATA E HORA ATUAL\n");
-                            send_string_bt("BUFFER PARA DATA E HORA ATUAL\n");
-                            gpio_set_level(SUCCESS_BUTTON, 1); // Aciona o GPIO de sucesso
-                            vTaskDelay(pdMS_TO_TICKS(1000));   // Aguarda 1 segundo
-                            gpio_set_level(SUCCESS_BUTTON, 0); // Desliga o GPIO
-                            dentro = 0;
-                        }
-                        else
-                        {
-                            // Se ele errou
-                            send_string_bt("Senha incorreta. \n");
-                            ESP_LOGI(SPP_TAG, "Senha incorreta! \n");
-                            gpio_set_level(FAILURE_BUTTON, 1); // Aciona o GPIO de falha
-                            vTaskDelay(pdMS_TO_TICKS(1000));   // Aguarda 1 segundo
-                            gpio_set_level(FAILURE_BUTTON, 0); // Desliga o GPIO
-                            dentro = 0;
-                        }
-
-                        // Resetamos o vetor senha para tentar de novo
-                        for (int i = 0; i < TAMANHO_SENHA; i++)
-                        {
-                            input_senha[i] = 0;
-                        }
-                        input_index = 0;
-                    }
-
-                    // Esperamos um pouquinho
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-            }
-            else
-            {
-                ESP_LOGW(SPP_TAG, "Unknown command: %s\n", received_msg);
-                send_string_bt("Unknown command.\n");
+            default:
+                break;
             }
         }
-        break;
         break;
 #else
         gettimeofday(&time_new, NULL);
@@ -379,6 +623,7 @@ void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 
 void app_main(void)
 {
+    // inicializando memoria flash interna
     esp_err_t ret = nvs_flash_init();
 
     // Configura o GPIO do botão como entrada com pull - down
@@ -401,6 +646,7 @@ void app_main(void)
 
     // printf("Botões inicializados com sucesso!\n");
 
+    // Verificando se a memoria flash interna foi inicializada com sucesso
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
         ESP_ERROR_CHECK(nvs_flash_erase());
